@@ -1,6 +1,13 @@
 // Plot draws a line/stacked-bar/pie chart (backed by uPlot) into a container element.
 //
-// Entry point: Plot.draw(containerId, data, opts).
+// Entry points: Plot.draw(containerId, data, opts), Plot.replace(containerId, data, opts),
+// Plot.append(containerId, rows).
+//   Plot.replace swaps the whole dataset of a drawn line chart for the given one, Plot.append adds rows to the
+//   dataset it already has. Neither recreates the chart, so cursor, legend state and user zoom are kept (the chart
+//   follows new points unless it is zoomed in). Plot.replace on a container without a chart draws it with opts,
+//   Plot.append on such a container does nothing and returns false. Plot.draw on a container that already has a
+//   chart replaces its dataset too.
+//   rows: [[...], ...] in the shape of data.values, new rows are expected to have X greater than existing ones.
 //   data: {columns: [...], values: [[...], ...]}, first column is the X axis (or, for
 //         opts.rows, each row is [x, y, label]). For opts.kind === "pie", each row is
 //         [count, label] (or [label, count]).
@@ -21,7 +28,17 @@ var Plot = (function () {
     // Deterministic random number generator, so series colors are stable across renders.
     const prng = splitmix32(12345)
 
+    // Charts by container id, for replace and append.
+    const charts = {}
+
+    // During a dry run (building data for replace or append) colors are not generated, to keep them stable.
+    let dry = false
+
     function getDarkColor() {
+        if (dry) {
+            return '#000'
+        }
+
         var color = '#';
         for (var i = 0; i < 6; i++) {
             color += Math.floor(2 + prng() * 11).toString(16);
@@ -480,11 +497,21 @@ var Plot = (function () {
             let item = sortedValues[i]
 
             for (let j = 0; j < item.length; j++) {
-                uplot_data[j].push(parseFloat(item[j]))
+                // Empty values are gaps (null), not NaN.
+                uplot_data[j].push(j === 0 ? parseFloat(item[j]) : toNumberOrNull(item[j]))
             }
         }
 
         return uplot_data
+    }
+
+    // lineData builds uPlot columnar data for opts, series are added to uplot_opts.
+    function lineData(data, opts, uplot_opts) {
+        if (opts.stackedBars) {
+            return opts.rows ? uplotBarsRowsData(data, uplot_opts) : uplotBarsColumnsData(data, uplot_opts)
+        }
+
+        return opts.rows ? uplotRowsData(data, uplot_opts) : uplotColumnsData(data, uplot_opts)
     }
 
     function drawLine(container, data, opts) {
@@ -503,20 +530,19 @@ var Plot = (function () {
             uplot_opts.scales.x.time = true
         }
 
-        let uplot_data
-        if (opts.stackedBars) {
-            uplot_data = opts.rows ? uplotBarsRowsData(data, uplot_opts) : uplotBarsColumnsData(data, uplot_opts)
-        } else if (opts.rows) {
-            uplot_data = uplotRowsData(data, uplot_opts)
-        } else {
-            uplot_data = uplotColumnsData(data, uplot_opts)
-        }
+        let uplot_data = lineData(data, opts, uplot_opts)
 
         if (opts.time) {
             applyTimeAxis(uplot_opts, opts.timeAxisFmt || null)
         }
 
-        new uPlot(uplot_opts, uplot_data, container);
+        charts[container.id] = {
+            u: new uPlot(uplot_opts, uplot_data, container),
+            container: container,
+            opts: opts,
+            data: data,
+            nseries: uplot_opts.series.length,
+        }
     }
 
     // drawPieChart renders a pie chart, courtesy of deepseek-r1:32b with minor changes.
@@ -637,12 +663,131 @@ var Plot = (function () {
         drawPieChart(pieData, opts.pieTotal || 0, container)
     }
 
+    // live returns a drawn chart of the container, if it is still in the page.
+    function live(container) {
+        let c = charts[container.id]
+        if (c && c.container === container && container.contains(c.u.root)) {
+            return c
+        }
+
+        if (c) {
+            c.u.destroy()
+            delete charts[container.id]
+        }
+
+        return null
+    }
+
+    // setChartData sets the full dataset of a drawn line chart, keeping cursor and zoom.
+    function setChartData(containerId, c, data) {
+        let o = uplotOpts(c.container)
+        let d
+        dry = true
+        try {
+            d = lineData(data, c.opts, o)
+        } finally {
+            dry = false
+        }
+
+        if (o.series.length !== c.nseries) { // Series set has changed, chart has to be rebuilt.
+            c.u.destroy()
+            delete charts[containerId]
+            draw(containerId, data, c.opts)
+
+            return
+        }
+
+        c.data = data
+        c.u.setData(d, isFollowing(c))
+    }
+
+    // isFollowing tells whether the chart shows all of its points, so new ones should be followed (not zoomed in).
+    function isFollowing(c) {
+        let xs = c.u.data[0]
+
+        return xs.length === 0 || (c.u.scales.x.min <= xs[0] && c.u.scales.x.max >= xs[xs.length - 1])
+    }
+
+    // appendFast pushes rows right to uPlot data, without rebuilding it from all the rows.
+    // It is only for column-shaped line data with ascending X, returns false if rows do not fit.
+    function appendFast(c, rows) {
+        if (c.opts.rows || c.opts.stackedBars) {
+            return false
+        }
+
+        let d = c.u.data
+        let last = d[0].length > 0 ? d[0][d[0].length - 1] : -Infinity
+        let xs = []
+        for (let i = 0; i < rows.length; i++) {
+            let x = toNumberOrNull(rows[i][0])
+            if (x === null || x <= last) {
+                return false
+            }
+
+            xs.push(x)
+            last = x
+        }
+
+        let following = isFollowing(c)
+
+        for (let i = 0; i < rows.length; i++) {
+            d[0].push(xs[i])
+            for (let j = 1; j < d.length; j++) {
+                d[j].push(j < rows[i].length ? toNumberOrNull(rows[i][j]) : null)
+            }
+
+            c.data.values.push(rows[i])
+        }
+
+        c.u.setData(d, following)
+
+        return true
+    }
+
+    // replace swaps the whole dataset of a drawn line chart, or draws the chart if there is none.
+    function replace(containerId, data, opts) {
+        let container = document.getElementById(containerId)
+        if (!container) {
+            return
+        }
+
+        let c = live(container)
+        if (!c) {
+            draw(containerId, data, opts)
+
+            return
+        }
+
+        setChartData(containerId, c, data)
+    }
+
+    // append adds rows to the dataset of a drawn line chart, returns false if there is no such chart.
+    function append(containerId, rows) {
+        let container = document.getElementById(containerId)
+        let c = container && live(container)
+        if (!c) {
+            return false
+        }
+
+        if (!appendFast(c, rows)) { // Rows are not just the next points, the dataset is rebuilt.
+            setChartData(containerId, c, {columns: c.data.columns, values: c.data.values.concat(rows)})
+        }
+
+        return true
+    }
+
     // draw renders data into the element identified by containerId, per opts.kind.
     function draw(containerId, data, opts) {
         opts = opts || {}
 
         let container = document.getElementById(containerId)
         if (!container) {
+            return
+        }
+
+        if (opts.kind !== 'pie' && live(container)) {
+            replace(containerId, data)
+
             return
         }
 
@@ -653,5 +798,5 @@ var Plot = (function () {
         }
     }
 
-    return {draw: draw};
+    return {draw: draw, replace: replace, append: append};
 })();
