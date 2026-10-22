@@ -39,6 +39,33 @@ See [example/main.go](example/main.go) for a complete, runnable app:
 go run ./example
 ```
 
+The example also has a live chart: the server produces a point every second, and the page polls
+`/points?since=<time of the last point>` and calls `Plot.append` with the new rows
+(see [Live updates](#live-updates)).
+
+## Live updates
+
+`Render` draws a chart once. Later (e.g. from a polling script) the chart can be changed in place with two JS calls,
+so cursor, legend state and user zoom are kept, and the X axis follows new points unless the chart is zoomed in:
+
+```js
+// Replace the whole dataset with a new full one.
+Plot.replace("requests", {columns: ["time", "requests"], values: [[1700000000, 12], [1700000060, 18]]}, opts)
+
+// Add rows to the existing dataset, rows have the shape of `values`, X is expected to be greater than existing.
+Plot.append("requests", [[1700000120, 21]])
+```
+
+- `Plot.replace(id, data, opts)` takes the same `data` as `Render`, `opts` is only used if the chart has not been
+  drawn yet, so it can also be used for the first draw. A changed point (e.g. the current, still growing, minute)
+  is simply a part of the new list.
+- `Plot.append(id, rows)` needs a drawn chart and returns `false` if there is none. For line charts with ascending X
+  the new values are pushed right to the chart (uPlot has no append call of its own, this is its `setData` over
+  the same arrays), so the cost does not depend on the number of points already there. Otherwise (rows shape,
+  stacked bars, X is not greater than the last one) the chart data is rebuilt from all the rows.
+
+Line and stacked-bar charts are supported, if the set of series changes the chart is rebuilt.
+
 ## Data
 
 `Data.Columns`/`Data.Values` is a plain table, first column generally the X axis:
