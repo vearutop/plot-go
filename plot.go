@@ -1,4 +1,4 @@
-// Package plot renders interactive line, stacked-bar and pie charts (backed by uPlot) as an
+// Package plot renders interactive line, stacked-bar, pie and heatmap charts (backed by uPlot) as an
 // HTML fragment, so any Go web app can embed a chart by calling Render with tabular data.
 //
 // Mount Handler under a path prefix and include HeadTags(prefix) in the page's <head>; then
@@ -56,9 +56,80 @@ type Kind string
 const (
 	Line Kind = "line"
 	Pie  Kind = "pie"
+
+	// Heatmap draws a histogram per X slice, e.g. a latency distribution over time. Each row of Data is
+	// (x, min, max, count, percent): [min, max] is a value bucket, percent is the share of count in its X slice.
+	// Buckets should be the same in all slices, see HeatmapOptions.
+	Heatmap Kind = "heatmap"
+
+	// Histogram draws bars of value buckets: equally spaced, labelled by the observed range of a bucket. Each row of
+	// Data is (min, max, count, percent), or (series, min, max, count, percent) to stack series (all series should
+	// have the same buckets). Percent is the share of all observations.
+	Histogram Kind = "histogram"
 )
 
+// AxisType selects how values of an axis are interpreted.
+type AxisType string
+
+// Supported axis types.
+const (
+	NumberAxis   AxisType = "number" // Default.
+	TimeAxis     AxisType = "time"   // Values are UTC Unix timestamps.
+	CategoryAxis AxisType = "category"
+)
+
+// Unit is a unit of values, it defines how they are shown.
+type Unit string
+
+// Supported units, other values are shown as is.
+const (
+	Seconds Unit = "s" // Go-style durations: 1h34m2s, 5d23h12m5s, 1.5s, 300ms.
+)
+
+// Axis configures an axis.
+type Axis struct {
+	// Type defaults to NumberAxis. TimeAxis and CategoryAxis are for X only.
+	Type AxisType `json:"type,omitempty"`
+
+	// Unit shows values of the axis in the unit, e.g. Seconds. Ignored for TimeAxis.
+	Unit Unit `json:"unit,omitempty"`
+
+	// Format overrides the label format of a TimeAxis, e.g. "{YYYY}-{MM}".
+	Format string `json:"format,omitempty"`
+}
+
+// Field describes a measured value that is not tied to one axis of every chart.
+type Field struct {
+	// Label names the value, e.g. in an axis title and tooltips of a Histogram.
+	Label string `json:"label,omitempty"`
+
+	// Unit of the value. For Heatmap the value is on the Y axis (and X is the slice), it is shown compactly,
+	// with two most significant units (1d23h46m as 1d23h).
+	Unit Unit `json:"unit,omitempty"`
+}
+
+// HeatmapOptions configures Heatmap charts.
+type HeatmapOptions struct {
+	// Percent colors cells by percent of their slice (normalizes busy and quiet slices), otherwise by count.
+	Percent bool `json:"percent,omitempty"`
+}
+
+// HistogramOptions configures Histogram charts.
+type HistogramOptions struct {
+	// Percent shows percent of all observations on the Y axis instead of counts.
+	Percent bool `json:"percent,omitempty"`
+}
+
+// PieOptions configures Pie charts.
+type PieOptions struct {
+	// Total overrides the computed total, for a Pie chart showing a partial breakdown.
+	Total float64 `json:"total,omitempty"`
+}
+
 // Options configures how Data is rendered.
+//
+// Which axis holds the measured value depends on the chart: for a line chart of durations it is Y (use Y.Unit),
+// for a Histogram it is X (Y is a count) and for a Heatmap it is Y (X is the slice), use Value.Unit for both.
 type Options struct {
 	Kind Kind `json:"kind,omitempty"` // Default Line.
 
@@ -68,17 +139,18 @@ type Options struct {
 	// StackedBars renders a stacked bar chart instead of lines. Ignored for Pie.
 	StackedBars bool `json:"stackedBars,omitempty"`
 
-	// Time treats the X axis as UTC Unix timestamps. Ignored for Pie.
-	Time bool `json:"time,omitempty"`
-
-	// TimeAxisFmt overrides the X axis label format, e.g. "{YYYY}-{MM}". Only applies with Time.
-	TimeAxisFmt string `json:"timeAxisFmt,omitempty"`
-
 	Caption string `json:"caption,omitempty"`
 	Height  int    `json:"height,omitempty"` // Pixels, default 300.
 
-	// PieTotal overrides the computed total, for a Pie chart showing a partial breakdown.
-	PieTotal float64 `json:"pieTotal,omitempty"`
+	X Axis `json:"x,omitempty,omitzero"`
+	Y Axis `json:"y,omitempty,omitzero"`
+
+	// Value is the measured value of a Heatmap or Histogram.
+	Value Field `json:"value,omitempty,omitzero"`
+
+	Heatmap   *HeatmapOptions   `json:"heatmap,omitempty"`   // For Heatmap.
+	Histogram *HistogramOptions `json:"histogram,omitempty"` // For Histogram.
+	Pie       *PieOptions       `json:"pie,omitempty"`       // For Pie.
 }
 
 // Render returns an HTML fragment: a container element plus the inline script that draws

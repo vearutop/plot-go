@@ -11,7 +11,16 @@
 //   data: {columns: [...], values: [[...], ...]}, first column is the X axis (or, for
 //         opts.rows, each row is [x, y, label]). For opts.kind === "pie", each row is
 //         [count, label] (or [label, count]).
-//   opts: {kind: "line"|"pie", rows, stackedBars, time, timeAxisFmt, caption, height, pieTotal}
+//   opts: {kind: "line"|"pie"|"heatmap"|"histogram", rows, stackedBars, caption, height, x, y, value, heatmap, pie}
+//         x, y: axis settings {type: "number"|"time"|"category", unit, format}. type "time" treats X values as UTC
+//               Unix timestamps, format overrides the time label format (e.g. "{YYYY}-{MM}"), unit "s" shows
+//               seconds as Go-style durations (1h34m2s), ignored for time. Only x has type and format.
+//         value: {unit} unit of the measured value of a heatmap (its Y axis), same units as axes.
+//         heatmap: data.values rows are [x, min, max, count, percent], opts.heatmap = {percent}, X is categorical
+//                  with x.type "category", numeric otherwise.
+//         histogram: data.values rows are [min, max, count, percent], or [series, min, max, count, percent] to stack
+//                    series, opts.histogram = {percent} (Y is percent of all observations), value: {unit, label}.
+//         pie: {total} overrides the computed total.
 var Plot = (function () {
     function splitmix32(a) {
         return function () {
@@ -192,6 +201,68 @@ var Plot = (function () {
                 }
             }
         });
+    }
+
+    // formatSeconds formats seconds like Go's time.Duration: 1h34m2s, 1.5s, 300ms.
+    function formatSeconds(v) {
+        v = Number(v);
+        if (!Number.isFinite(v)) {
+            return String(v);
+        }
+        if (v === 0) {
+            return '0s';
+        }
+
+        const sign = v < 0 ? '-' : '';
+        v = Math.abs(v);
+        if (v < 1) {
+            for (const [unit, mul] of [['ms', 1e3], ['µs', 1e6], ['ns', 1e9]]) {
+                if (v * mul >= 1 || unit === 'ns') {
+                    return sign + parseFloat((v * mul).toFixed(3)) + unit;
+                }
+            }
+        }
+
+        const d = Math.floor(v / 86400), h = Math.floor(v % 86400 / 3600), m = Math.floor(v % 3600 / 60);
+
+        return sign + (d ? d + 'd' : '') + (d || h ? h + 'h' : '') + (d || h || m ? m + 'm' : '') + parseFloat((v % 60).toFixed(3)) + 's';
+    }
+
+    // compactSeconds is formatSeconds cut to the two most significant units without zero tail: 1d23h46m -> 1d23h.
+    function compactSeconds(v) {
+        const parts = formatSeconds(v).match(/-?\d+(?:\.\d+)?[a-zµ]+/g);
+        if (!parts) {
+            return formatSeconds(v);
+        }
+
+        parts.length = Math.min(parts.length, 2);
+        while (parts.length > 1 && parseFloat(parts[parts.length - 1]) === 0) {
+            parts.pop();
+        }
+
+        return parts.join('');
+    }
+
+    // unitFmt returns a value formatter for a unit, compact keeps two most significant units.
+    function unitFmt(unit, compact) {
+        return unit === 's' ? (compact ? compactSeconds : formatSeconds) : String;
+    }
+
+    function isTime(opts) {
+        return !!(opts.x && opts.x.type === 'time');
+    }
+
+    function applyUnitAxes(uplot_opts, opts) {
+        if (opts.x && opts.x.unit === 's' && !isTime(opts)) {
+            uplot_opts.axes[0].values = (u, vals) => vals.map(formatSeconds);
+            if (uplot_opts.series[0]) {
+                uplot_opts.series[0].value = (u, v) => v == null ? null : formatSeconds(v);
+            }
+        }
+
+        if (opts.y && opts.y.unit === 's') {
+            uplot_opts.axes[1].values = (u, vals) => vals.map(formatSeconds);
+        }
     }
 
     function applyTimeAxis(uplot_opts, axisFmt) {
@@ -514,6 +585,341 @@ var Plot = (function () {
         return opts.rows ? uplotRowsData(data, uplot_opts) : uplotColumnsData(data, uplot_opts)
     }
 
+    // heatColor maps t in [0, 1] to a sequential light-to-dark blue ramp.
+    function heatColor(t) {
+        t = Math.pow(Math.min(1, Math.max(0, t)), 0.6); // Lift low values to keep them visible.
+        const from = [235, 242, 250], to = [8, 48, 107];
+
+        return 'rgb(' + from.map((f, i) => Math.round(f + (to[i] - f) * t)).join(',') + ')';
+    }
+
+    const histogramColors = ['#4682b4', '#e08a3c', '#5aa469', '#c8553d', '#8e6bbf', '#b5a642', '#3fa7a3', '#c76f9f', '#7f7f7f', '#a0522d'];
+
+    // drawHistogram renders rows [min, max, count, percent] (one series) or [series, min, max, count, percent] as
+    // bars: one per value bucket, equally spaced, labelled by the observed range (widths do not imply equal ranges).
+    // Series are stacked in the order of appearance.
+    //   opts: {histogram: {percent}, value: {unit, label}, caption, height}
+    function drawHistogram(container, data, opts) {
+        const info = opts.histogram || {};
+        const rows = data.values || [];
+        if (!rows.length) {
+            container.textContent = 'No histogram observations.';
+
+            return;
+        }
+
+        const percent = !!info.percent;
+        const fmt = unitFmt((opts.value || {}).unit);
+        const label = (opts.value || {}).label || 'value';
+
+        // Rows without a series column are one series.
+        const withSeries = rows[0].length >= 5;
+        const buckets = [];
+        const bucketIdx = new Map();
+        const series = [];
+        const seriesIdx = new Map();
+        const norm = rows.map(r => withSeries ? r : [''].concat(r));
+
+        norm.forEach(r => {
+            if (!seriesIdx.has(r[0])) {
+                seriesIdx.set(r[0], series.length);
+                series.push(r[0]);
+            }
+            if (!bucketIdx.has(r[1] + ':' + r[2])) {
+                bucketIdx.set(r[1] + ':' + r[2], 0);
+                buckets.push([Number(r[1]), Number(r[2])]);
+            }
+        });
+        buckets.sort((a, b) => a[0] - b[0]);
+        buckets.forEach((b, i) => bucketIdx.set(b[0] + ':' + b[1], i));
+
+        // cells[series][bucket] = {count, percent}
+        const cells = series.map(() => buckets.map(() => ({count: 0, percent: 0})));
+        norm.forEach(r => {
+            cells[seriesIdx.get(r[0])][bucketIdx.get(r[1] + ':' + r[2])] = {count: Number(r[3]), percent: Number(r[4])};
+        });
+        const val = c => percent ? c.percent : c.count;
+
+        const range = i => '[' + fmt(buckets[i][0]) + ':' + fmt(buckets[i][1]) + ']';
+        const color = si => series.length === 1 ? histogramColors[0] : histogramColors[si % histogramColors.length];
+        const tooltip = document.createElement('div');
+        tooltip.hidden = true;
+        tooltip.style.cssText = 'position:absolute;pointer-events:none;background:#222;color:#fff;' +
+            'padding:6px 9px;border-radius:4px;z-index:10;white-space:pre';
+
+        // visibleMax is the highest stack of series that are shown.
+        const visibleMax = u => {
+            let max = 0;
+            for (let b = 0; b < buckets.length; b++) {
+                let sum = 0;
+                series.forEach((_, si) => {
+                    if (u.series[si + 1].show) {
+                        sum += val(cells[si][b]);
+                    }
+                });
+                max = Math.max(max, sum);
+            }
+
+            return max;
+        };
+
+        const uplot_opts = uplotOpts(container);
+        uplot_opts.width = Math.max(300, container.clientWidth || 600);
+        uplot_opts.height = opts.height || 360;
+        uplot_opts.title = opts.caption || label + ' distribution';
+        uplot_opts.cursor = {drag: {x: false, y: false}, points: {show: false}};
+        uplot_opts.scales = {
+            x: {time: false, range: () => [-0.5, buckets.length - 0.5]},
+            y: {auto: true, range: u => { const m = visibleMax(u); return [0, m > 0 ? m * 1.1 : 1]; }},
+        };
+        uplot_opts.axes = [
+            {
+                label: label + ' range',
+                size: 90,
+                rotate: -30,
+                splits: (u, axisIdx, min, max) => {
+                    const start = Math.max(0, Math.ceil(min));
+                    const end = Math.min(buckets.length - 1, Math.floor(max));
+                    const step = Math.max(1, Math.ceil((end - start + 1) / Math.max(1, Math.floor(u.width / 100))));
+                    const ticks = [];
+                    for (let i = start; i <= end; i += step) ticks.push(i);
+
+                    return ticks;
+                },
+                values: (u, ticks) => ticks.map(tick => buckets[tick] ? range(tick) : ''),
+            },
+            {
+                label: percent ? 'Items (%)' : 'Items',
+                size: 80,
+                values: (u, ticks) => ticks.map(tick => percent ? tick + '%' :
+                    Number(tick).toLocaleString(undefined, {notation: 'compact', maximumFractionDigits: 2})),
+            },
+        ];
+        uplot_opts.series = [{label: 'Range', value: (u, v, si, idx) => buckets[idx] ? range(idx) : '—'}].concat(
+            series.map((name, si) => ({
+                label: name || (percent ? 'Items (%)' : 'Items'),
+                paths: () => null,
+                points: {show: false},
+                stroke: color(si),
+                fill: color(si),
+                value: (u, v, sidx, idx) => idx == null || !buckets[idx] ? '—' :
+                    cells[si][idx].count + ' (' + cells[si][idx].percent.toFixed(2) + '%)',
+            })));
+                uplot_opts.hooks = {
+            draw: [u => {
+                const ctx = u.ctx;
+                ctx.save();
+                ctx.beginPath();
+                ctx.rect(u.bbox.left, u.bbox.top, u.bbox.width, u.bbox.height);
+                ctx.clip();
+                const half = Math.abs(u.valToPos(1, 'x', true) - u.valToPos(0, 'x', true)) * 0.45;
+                for (let b = 0; b < buckets.length; b++) {
+                    const cx = u.valToPos(b, 'x', true);
+                    let sum = 0;
+                    series.forEach((_, si) => {
+                        if (!u.series[si + 1].show) {
+                            return;
+                        }
+                        const v = val(cells[si][b]);
+                        if (v > 0) {
+                            ctx.fillStyle = color(si);
+                            const y0 = u.valToPos(sum, 'y', true), y1 = u.valToPos(sum + v, 'y', true);
+                            ctx.fillRect(Math.round(cx - half), Math.round(y1), Math.max(1, Math.round(2 * half)), Math.max(1, Math.round(y0 - y1)));
+                        }
+                        sum += v;
+                    });
+                }
+                ctx.restore();
+            }],
+            ready: [u => { u.over.appendChild(tooltip); }],
+            setCursor: [u => {
+                const idx = u.cursor.idx;
+                tooltip.hidden = idx == null || !buckets[idx] || u.cursor.left < 0 || u.cursor.top < 0;
+                if (tooltip.hidden) {
+                    return;
+                }
+
+                const lines = [label + ' in ' + range(idx)];
+                series.forEach((name, si) => {
+                    const c = cells[si][idx];
+                    if (c.count > 0 && u.series[si + 1].show) {
+                        lines.push((name ? name + ': ' : '') + c.count + ' items (' + c.percent.toFixed(2) + '%)');
+                    }
+                });
+                tooltip.textContent = lines.join('\n');
+                tooltip.style.left = Math.max(0, Math.min(u.cursor.left + 12, u.over.clientWidth - tooltip.offsetWidth)) + 'px';
+                tooltip.style.top = Math.max(0, u.cursor.top - tooltip.offsetHeight - 12) + 'px';
+            }],
+        };
+
+        const chart = new uPlot(uplot_opts, [buckets.map((b, i) => i)].concat(series.map(() => buckets.map(() => null))), container);
+
+        // Keep the width with the container, the chart is gone with it.
+        if (typeof ResizeObserver !== 'undefined') {
+            const observer = new ResizeObserver(() => {
+                if (!container.isConnected) {
+                    chart.destroy();
+                    observer.disconnect();
+
+                    return;
+                }
+                chart.setSize({width: Math.max(300, container.clientWidth || 600), height: opts.height || 360});
+            });
+            observer.observe(container);
+        }
+    }
+
+    // drawHeatmap renders rows [x, min, max, count, percent] as cells: x slices on the horizontal axis and
+    // value buckets (equal-height rows, ordered by min) on the vertical one, colored by percent or count.
+    //   opts: {heatmap: {percent}, x: {type, unit, format}, value: {unit} (the Y axis), caption, height}
+    function drawHeatmap(container, data, opts) {
+        const info = opts.heatmap || {};
+        const xo = opts.x || {};
+        const time = xo.type === 'time';
+        const rows = data.values || [];
+        if (!rows.length) {
+            container.textContent = 'No heatmap observations.';
+
+            return;
+        }
+
+        const fmtV = unitFmt((opts.value || {}).unit);
+        const fmtX = unitFmt(xo.unit);
+
+        // Distinct value buckets and x slices.
+        const bucketKey = r => r[1] + ':' + r[2];
+        const buckets = [];
+        const seenBucket = new Set();
+        rows.forEach(r => {
+            if (!seenBucket.has(bucketKey(r))) {
+                seenBucket.add(bucketKey(r));
+                buckets.push([Number(r[1]), Number(r[2])]);
+            }
+        });
+        buckets.sort((a, b) => a[0] - b[0]);
+        const bucketIdx = new Map(buckets.map((b, i) => [b[0] + ':' + b[1], i]));
+
+        const xs = [];
+        const xIdx = new Map();
+        rows.forEach(r => {
+            if (!xIdx.has(r[0])) {
+                xIdx.set(r[0], xs.length);
+                xs.push(r[0]);
+            }
+        });
+
+        // Numeric x is positioned by value, tiles are as wide as the smallest gap; categories are index-positioned.
+        const numeric = xo.type !== 'category';
+        const xv = numeric ? xs.map(Number) : xs.map((x, i) => i);
+        let step = 1;
+        for (let i = 1; i < xv.length; i++) {
+            step = i === 1 ? xv[1] - xv[0] : Math.min(step, xv[i] - xv[i - 1]);
+        }
+
+        // Cells and the color scale.
+        const colorBy = info.percent ? 4 : 3;
+        let maxV = 0;
+        const cells = rows.map(r => {
+            const v = Number(r[colorBy]);
+            maxV = Math.max(maxV, v);
+
+            return {xi: xIdx.get(r[0]), yi: bucketIdx.get(bucketKey(r)), v: v, count: r[3], percent: Number(r[4])};
+        });
+        const lookup = new Map(cells.map(c => [c.xi + ':' + c.yi, c]));
+
+        const tooltip = document.createElement('div');
+        tooltip.hidden = true;
+        tooltip.style.cssText = 'position:absolute;pointer-events:none;background:#222;color:#fff;' +
+            'padding:6px 9px;border-radius:4px;z-index:10;white-space:nowrap';
+
+        const xLabel = i => numeric && time ? uPlot.fmtDate("{YYYY}-{MM}-{DD} {HH}:{mm}")(uPlot.tzDate(new Date(xv[i] * 1e3), 'Etc/UTC')) : fmtX(xs[i]);
+        const yLabel = i => '[' + fmtV(buckets[i][0]) + ':' + fmtV(buckets[i][1]) + ']';
+
+        const uplot_opts = uplotOpts(container);
+        uplot_opts.legend = {show: false};
+        uplot_opts.cursor = {drag: {x: false, y: false}, points: {show: false}};
+        uplot_opts.scales = {
+            x: {time: numeric && time, range: () => [xv[0] - step / 2, xv[xv.length - 1] + step / 2]},
+            y: {range: () => [-0.5, buckets.length - 0.5]},
+        };
+        uplot_opts.series = [{}, {label: 'cells', paths: () => null, points: {show: false}}];
+        uplot_opts.axes = [
+            {values: numeric ? (u, vals) => vals.map(v => fmtX(v)) : (u, vals) => vals.map(v => Number.isInteger(v) && xs[v] !== undefined ? fmtX(xs[v]) : '')},
+            {
+                size: 90,
+                splits: (u, axisIdx, min, max) => {
+                    const step = Math.max(1, Math.ceil(buckets.length / Math.max(1, Math.floor(u.height / 40))));
+                    const ticks = [];
+                    for (let i = 0; i < buckets.length; i += step) ticks.push(i);
+
+                    return ticks;
+                },
+                // Only the upper bound of a bucket, compact, to fit the axis; tooltip has the precise range.
+                values: (u, vals) => vals.map(v => buckets[v] ? unitFmt((opts.value || {}).unit, true)(buckets[v][1]) : ''),
+            },
+        ];
+        uplot_opts.height = opts.height || 360;
+        uplot_opts.title = opts.caption;
+        if (numeric && time) {
+            applyTimeAxis(uplot_opts, xo.format || null);
+            uplot_opts.series = [{}, {label: 'cells', paths: () => null, points: {show: false}}];
+        }
+
+        uplot_opts.hooks = {
+            draw: [u => {
+                const ctx = u.ctx;
+                ctx.save();
+                ctx.beginPath();
+                ctx.rect(u.bbox.left, u.bbox.top, u.bbox.width, u.bbox.height);
+                ctx.clip();
+                cells.forEach(c => {
+                    const x0 = Math.round(u.valToPos(xv[c.xi] - step / 2, 'x', true));
+                    const x1 = Math.round(u.valToPos(xv[c.xi] + step / 2, 'x', true));
+                    const y0 = Math.round(u.valToPos(c.yi + 0.5, 'y', true));
+                    const y1 = Math.round(u.valToPos(c.yi - 0.5, 'y', true));
+                    ctx.fillStyle = heatColor(maxV > 0 ? c.v / maxV : 0);
+                    ctx.fillRect(x0, y0, Math.max(1, x1 - x0), Math.max(1, y1 - y0));
+                });
+                ctx.restore();
+            }],
+            setCursor: [u => {
+                const {left, top} = u.cursor;
+                if (left == null || left < 0 || top < 0) {
+                    tooltip.hidden = true;
+
+                    return;
+                }
+
+                // Nearest x slice, within half a step.
+                const xval = u.posToVal(left, 'x');
+                let xi = -1;
+                for (let i = 0; i < xv.length; i++) {
+                    if (Math.abs(xv[i] - xval) <= step / 2 && (xi === -1 || Math.abs(xv[i] - xval) < Math.abs(xv[xi] - xval))) {
+                        xi = i;
+                    }
+                }
+
+                const yi = Math.round(u.posToVal(top, 'y'));
+                const c = lookup.get(xi + ':' + yi);
+                if (!c) {
+                    tooltip.hidden = true;
+
+                    return;
+                }
+
+                tooltip.textContent = xLabel(xi) + ', ' + yLabel(yi) + ': ' + c.count + ' items (' + c.percent.toFixed(2) + '% of slice)';
+                tooltip.style.left = (u.bbox.left / devicePixelRatio + left + 12) + 'px';
+                tooltip.style.top = (u.bbox.top / devicePixelRatio + top + 12) + 'px';
+                tooltip.hidden = false;
+            }],
+        };
+
+        container.style.position = 'relative';
+        const u = new uPlot(uplot_opts, [xv, xv.map(() => null)], container);
+        container.appendChild(tooltip);
+        charts[container.id] = {u: u, container: container, opts: opts, data: data, nseries: 2};
+    }
+
     function drawLine(container, data, opts) {
         let uplot_opts = uplotOpts(container)
         applyLegendSortOnHover(uplot_opts)
@@ -526,15 +932,17 @@ var Plot = (function () {
             uplot_opts.height = opts.height
         }
 
-        if (opts.time) {
+        if (isTime(opts)) {
             uplot_opts.scales.x.time = true
         }
 
         let uplot_data = lineData(data, opts, uplot_opts)
 
-        if (opts.time) {
-            applyTimeAxis(uplot_opts, opts.timeAxisFmt || null)
+        if (isTime(opts)) {
+            applyTimeAxis(uplot_opts, (opts.x && opts.x.format) || null)
         }
+
+        applyUnitAxes(uplot_opts, opts)
 
         charts[container.id] = {
             u: new uPlot(uplot_opts, uplot_data, container),
@@ -660,7 +1068,7 @@ var Plot = (function () {
             )
         }
 
-        drawPieChart(pieData, opts.pieTotal || 0, container)
+        drawPieChart(pieData, (opts.pie && opts.pie.total) || 0, container)
     }
 
     // live returns a drawn chart of the container, if it is still in the page.
@@ -782,6 +1190,18 @@ var Plot = (function () {
 
         let container = document.getElementById(containerId)
         if (!container) {
+            return
+        }
+
+        if (opts.kind === 'histogram') {
+            drawHistogram(container, data, opts)
+
+            return
+        }
+
+        if (opts.kind === 'heatmap') {
+            drawHeatmap(container, data, opts)
+
             return
         }
 
