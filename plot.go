@@ -62,7 +62,7 @@ const (
 	// Buckets should be the same in all slices, see HeatmapOptions.
 	Heatmap Kind = "heatmap"
 
-	// Histogram draws bars of value buckets: equally spaced, labelled by the observed range of a bucket. Each row of
+	// Histogram draws bars of value buckets: equally spaced, labeled by the observed range of a bucket. Each row of
 	// Data is (min, max, count, percent), or (series, min, max, count, percent) to stack series (all series should
 	// have the same buckets). Percent is the share of all observations.
 	Histogram Kind = "histogram"
