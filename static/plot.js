@@ -640,7 +640,7 @@ var Plot = (function () {
         });
         const val = c => percent ? c.percent : c.count;
 
-        const range = i => '[' + fmt(buckets[i][0]) + ':' + fmt(buckets[i][1]) + ']';
+        const range = i => buckets[i][0] === buckets[i][1] ? String(fmt(buckets[i][0])) : '[' + fmt(buckets[i][0]) + ':' + fmt(buckets[i][1]) + ']';
         const color = si => series.length === 1 ? histogramColors[0] : histogramColors[si % histogramColors.length];
         const tooltip = document.createElement('div');
         tooltip.hidden = true;
@@ -833,7 +833,7 @@ var Plot = (function () {
             'padding:6px 9px;border-radius:4px;z-index:10;white-space:nowrap';
 
         const xLabel = i => numeric && time ? uPlot.fmtDate("{YYYY}-{MM}-{DD} {HH}:{mm}")(uPlot.tzDate(new Date(xv[i] * 1e3), 'Etc/UTC')) : fmtX(xs[i]);
-        const yLabel = i => '[' + fmtV(buckets[i][0]) + ':' + fmtV(buckets[i][1]) + ']';
+        const yLabel = i => buckets[i][0] === buckets[i][1] ? String(fmtV(buckets[i][0])) : '[' + fmtV(buckets[i][0]) + ':' + fmtV(buckets[i][1]) + ']';
 
         const uplot_opts = uplotOpts(container);
         uplot_opts.legend = {show: false};
